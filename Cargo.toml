@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "rg_core",
+    "rg_render",
+    "rg_app",
+]
+resolver = "2"
