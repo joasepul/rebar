@@ -7,12 +7,67 @@ use winit::{
 };
 use rg_core::{Graph, QuadTree, AABB, FruchtermanReingold, LayoutState, ForceAtlas2, NodeData};
 use rg_render::{Renderer, Camera};
-use glam::Vec2;
+use glam::{Vec2, Vec3, Mat4};
 use rand::Rng;
 use std::sync::Arc;
 use std::thread;
-use crossbeam::channel::Receiver;
+use crossbeam::channel::{Receiver, Sender};
 use std::collections::HashMap;
+
+struct FilterState {
+    // Ranges
+    min_degree: f32,
+    max_degree: f32,
+    min_community_size: usize,
+    max_community_size: usize,
+    
+    // Data limits
+    data_min_degree: f32,
+    data_max_degree: f32,
+    data_max_community_size: usize,
+    
+    // Histograms
+    degree_histogram: Vec<egui_plot::Bar>,
+    community_size_histogram: Vec<egui_plot::Bar>,
+    
+    // Max counts for visualization
+    max_degree_count: f64,
+    max_community_count: f64,
+    
+    // Bin widths
+    degree_bin_width: f32,
+    community_bin_width: f32,
+    
+    // Dirty flags to recompute histograms
+    dirty: bool,
+    
+    // Interaction state
+    drag_start_degree: Option<f32>,
+    drag_start_community: Option<f32>,
+}
+
+impl Default for FilterState {
+    fn default() -> Self {
+        Self {
+            min_degree: 0.0,
+            max_degree: f32::MAX,
+            min_community_size: 0,
+            max_community_size: usize::MAX,
+            data_min_degree: 0.0,
+            data_max_degree: 100.0,
+            data_max_community_size: 100,
+            degree_histogram: Vec::new(),
+            community_size_histogram: Vec::new(),
+            max_degree_count: 0.0,
+            max_community_count: 0.0,
+            degree_bin_width: 1.0,
+            community_bin_width: 1.0,
+            dirty: true,
+            drag_start_degree: None,
+            drag_start_community: None,
+        }
+    }
+}
 
 struct App {
     window: Option<Arc<Window>>,
@@ -25,6 +80,7 @@ struct App {
     current_k: f32,
     node_scale: f32,
     edge_scale: f32,
+    text_scale: f32,
     scale_by_degree: bool,
     prevent_overlap: bool,
     leiden_gamma: f32,
@@ -34,14 +90,19 @@ struct App {
     communities: HashMap<u32, CommunityInfo>,
     selected_tab: usize, // 0: Controls, 1: Communities
     hovered_community: Option<u32>,
+
     highlight_neighbors: bool,
+    show_node_ids: bool,
+    filter_state: FilterState,
     
     layout_mode: LayoutType,
     fa2_scaling: f32,
     fa2_gravity: f32,
     fr_temperature: f32,
     fr_cooling: f32,
+
     fr_k: f32,
+    layout_running: bool,
     
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
@@ -51,7 +112,8 @@ struct App {
     last_cursor_pos: Option<Vec2>,
     hovered_node: Option<usize>,
     selected_node: Option<usize>,
-    is_dragging_node: bool,
+    dragging_node: Option<usize>,
+    drag_start_pos: Option<Vec2>,
     
     // Stats
     last_frame_time: std::time::Instant,
@@ -73,6 +135,7 @@ impl App {
             current_k: 50.0,
             node_scale: 1.0,
             edge_scale: 1.0,
+            text_scale: 1.0,
             scale_by_degree: false,
             prevent_overlap: false,
             leiden_gamma: 1.0,
@@ -80,25 +143,223 @@ impl App {
             communities: HashMap::new(),
             selected_tab: 0,
             hovered_community: None,
+
             highlight_neighbors: true,
+            show_node_ids: false,
+            filter_state: FilterState::default(),
             layout_mode: LayoutType::FruchtermanReingold,
             fa2_scaling: 10.0,
             fa2_gravity: 1.0,
             fr_temperature: 100.0, // Default start temp
             fr_cooling: 0.95,
             fr_k: 10.0, // Default optimal distance
+            layout_running: true,
             egui_ctx: egui::Context::default(),
             egui_state: None,
             is_dragging_camera: false,
             last_cursor_pos: None,
             hovered_node: None,
             selected_node: None,
-            is_dragging_node: false,
+            dragging_node: None,
+            drag_start_pos: None,
             last_frame_time: std::time::Instant::now(),
             frame_count: 0,
             fps: 0.0,
             node_count,
         }
+    }
+    fn update_histograms(graph: &Graph, communities: &HashMap<u32, CommunityInfo>, filter_state: &mut FilterState) {
+        if !filter_state.dirty {
+            return;
+        }
+        
+        // Degree Histogram
+        let mut degrees = Vec::with_capacity(graph.node_count());
+        let mut max_degree = 0.0f32;
+        let mut min_degree = f32::MAX;
+        
+        for i in 0..graph.node_count() {
+            let d = graph.neighbors(i).len() as f32;
+            degrees.push(d);
+            max_degree = max_degree.max(d);
+            min_degree = min_degree.min(d);
+        }
+        
+        if degrees.is_empty() {
+            max_degree = 10.0;
+            min_degree = 0.0;
+        }
+        
+        filter_state.data_min_degree = min_degree;
+        filter_state.data_max_degree = max_degree;
+        
+        // Initialize sliders if first run (max_degree was f32::MAX)
+        if filter_state.max_degree == f32::MAX {
+            filter_state.max_degree = max_degree;
+        }
+        
+        // Binning
+        let bin_count = 50;
+        let bin_width = (max_degree - min_degree) / bin_count as f32;
+        let bin_width = bin_width.max(1.0);
+        filter_state.degree_bin_width = bin_width;
+        
+        let mut bins = vec![0u32; bin_count + 1];
+        
+        for &d in &degrees {
+            let bin_idx = ((d - min_degree) / bin_width).floor() as usize;
+            if bin_idx < bins.len() {
+                bins[bin_idx] += 1;
+            }
+        }
+        
+        let mut max_count: f64 = 0.0;
+        filter_state.degree_histogram = bins.iter().enumerate().map(|(i, &count)| {
+            let x = min_degree + i as f32 * bin_width + bin_width * 0.5;
+            max_count = max_count.max(count as f64);
+            egui_plot::Bar::new(x as f64, count as f64).width(bin_width as f64)
+        }).collect();
+        filter_state.max_degree_count = max_count;
+        
+        // Community Size Histogram
+        if !communities.is_empty() {
+            let mut sizes = Vec::new();
+            let mut max_size = 0;
+            
+            for comm in communities.values() {
+                sizes.push(comm.count);
+                max_size = max_size.max(comm.count);
+            }
+            
+            filter_state.data_max_community_size = max_size;
+            if filter_state.max_community_size == usize::MAX {
+                filter_state.max_community_size = max_size;
+            }
+            
+            let bin_count = 20;
+            let bin_width = (max_size as f32 / bin_count as f32).max(1.0);
+            filter_state.community_bin_width = bin_width;
+            
+            let mut bins = vec![0u32; bin_count + 1];
+            for &s in &sizes {
+                let bin_idx = ((s as f32) / bin_width).floor() as usize;
+                if bin_idx < bins.len() {
+                    bins[bin_idx] += 1;
+                }
+            }
+            
+            let mut max_count: f64 = 0.0;
+            filter_state.community_size_histogram = bins.iter().enumerate().map(|(i, &count)| {
+                let x = i as f32 * bin_width + bin_width * 0.5;
+                max_count = max_count.max(count as f64);
+                egui_plot::Bar::new(x as f64, count as f64).width(bin_width as f64)
+            }).collect();
+            filter_state.max_community_count = max_count;
+        }
+        
+        filter_state.dirty = false;
+    }
+    
+    fn update_layout_filters(graph: &Graph, communities: &HashMap<u32, CommunityInfo>, assignments: &[u32], filter_state: &FilterState, control_tx: &Sender<LayoutParam>) {
+        // Compute active mask
+        let mut active_mask = Vec::with_capacity(graph.node_count());
+        
+        for i in 0..graph.node_count() {
+            let mut active = true;
+            
+            // Degree
+            let degree = graph.neighbors(i).len() as f32;
+            if degree < filter_state.min_degree || degree > filter_state.max_degree {
+                active = false;
+            }
+            
+            // Community
+            if active && !assignments.is_empty() {
+                if let Some(&comm_id) = assignments.get(i) {
+                    if let Some(info) = communities.get(&comm_id) {
+                        if info.count < filter_state.min_community_size || info.count > filter_state.max_community_size {
+                            active = false;
+                        }
+                    }
+                }
+            }
+            
+            active_mask.push(active);
+        }
+        
+        let _ = control_tx.send(LayoutParam::UpdateActiveNodes(active_mask));
+    }
+
+    fn draw_filter_plot(
+        ui: &mut egui::Ui,
+        id: &str,
+        histogram: Vec<egui_plot::Bar>,
+        height: f32,
+        bar_color: egui::Color32,
+        highlight_color: egui::Color32,
+        current_range: std::ops::RangeInclusive<f32>,
+        data_range: std::ops::RangeInclusive<f32>,
+        max_count: f64,
+        bin_width: f64,
+        mut drag_start: Option<f32>,
+        mut on_change: impl FnMut(f32, f32),
+    ) -> Option<f32> {
+        let chart = egui_plot::BarChart::new(histogram)
+            .color(bar_color)
+            .name(id);
+
+        egui_plot::Plot::new(id)
+            .height(height)
+            .allow_drag(false)
+            .allow_zoom(false)
+            .allow_scroll(false)
+            .show(ui, |plot_ui| {
+                let min = *current_range.start();
+                let max = *current_range.end();
+                
+                // Highlight selection (behind bars)
+                // Extend max by bin_width to cover the full bin
+                let visual_max = max as f64 + bin_width;
+                
+                let highlight = egui_plot::Polygon::new(egui_plot::PlotPoints::new(vec![
+                    [min as f64, 0.0],
+                    [visual_max, 0.0],
+                    [visual_max, max_count],
+                    [min as f64, max_count],
+                ]))
+                .fill_color(highlight_color);
+                plot_ui.polygon(highlight);
+                
+                // Vertical lines at bounds
+                plot_ui.vline(egui_plot::VLine::new(min as f64).stroke(egui::Stroke::new(1.0, egui::Color32::WHITE)));
+                plot_ui.vline(egui_plot::VLine::new(visual_max).stroke(egui::Stroke::new(1.0, egui::Color32::WHITE)));
+                
+                plot_ui.bar_chart(chart);
+                
+                // Handle interaction (Range Drag)
+                if plot_ui.response().drag_started() {
+                    if let Some(pointer_pos) = plot_ui.pointer_coordinate() {
+                        drag_start = Some(pointer_pos.x as f32);
+                    }
+                }
+                
+                if plot_ui.response().dragged() {
+                    if let Some(start) = drag_start {
+                        if let Some(pointer_pos) = plot_ui.pointer_coordinate() {
+                            let current = pointer_pos.x as f32;
+                            let new_min = start.min(current).clamp(*data_range.start(), *data_range.end());
+                            let new_max = start.max(current).clamp(*data_range.start(), *data_range.end());
+                            on_change(new_min, new_max);
+                        }
+                    }
+                }
+                
+                if plot_ui.response().drag_stopped() {
+                    drag_start = None;
+                }
+            });
+            
+        drag_start
     }
 }
 
@@ -174,25 +435,44 @@ impl ApplicationHandler for App {
                 match button {
                     MouseButton::Left => {
                         if state == ElementState::Pressed {
+                            // Store start position for click detection
+                            self.drag_start_pos = self.last_cursor_pos;
+                            
                             if let Some(node_idx) = self.hovered_node {
-                                self.selected_node = Some(node_idx);
-                                self.is_dragging_node = true;
+                                // Start dragging node, but don't select yet
+                                self.dragging_node = Some(node_idx);
                                 // Pin the node in layout thread
                                 let _ = self.control_tx.send(LayoutParam::DragNode(node_idx, self.graph.nodes[node_idx].data.position));
                             } else {
+                                // Start dragging camera
                                 self.is_dragging_camera = true;
-                                self.selected_node = None;
                             }
                         } else {
-                            // Unpin the node
-                            if self.is_dragging_node {
-                                if let Some(idx) = self.selected_node {
-                                    let _ = self.control_tx.send(LayoutParam::ReleaseNode(idx));
+                            // Released
+                            let mut is_click = false;
+                            if let (Some(start), Some(end)) = (self.drag_start_pos, self.last_cursor_pos) {
+                                if (start - end).length() < 5.0 {
+                                    is_click = true;
                                 }
                             }
                             
+                            // Handle Click (Selection)
+                            if is_click {
+                                if let Some(node_idx) = self.hovered_node {
+                                    self.selected_node = Some(node_idx);
+                                } else {
+                                    self.selected_node = None;
+                                }
+                            }
+                            
+                            // Unpin the node if we were dragging
+                            if let Some(idx) = self.dragging_node {
+                                let _ = self.control_tx.send(LayoutParam::ReleaseNode(idx));
+                            }
+                            
                             self.is_dragging_camera = false;
-                            self.is_dragging_node = false;
+                            self.dragging_node = None;
+                            self.drag_start_pos = None;
                         }
                     }
                     _ => {}
@@ -223,12 +503,10 @@ impl ApplicationHandler for App {
                 // Find nearest node
                 self.hovered_node = self.quadtree.find_nearest(mouse_world_pos, 15.0 * world_per_pixel);
                 
-                if self.is_dragging_node {
-                    if let Some(idx) = self.selected_node {
-                        self.graph.nodes[idx].data.position = mouse_world_pos;
-                        // Update pinned position in layout thread
-                        let _ = self.control_tx.send(LayoutParam::DragNode(idx, mouse_world_pos));
-                    }
+                if let Some(idx) = self.dragging_node {
+                    self.graph.nodes[idx].data.position = mouse_world_pos;
+                    // Update pinned position in layout thread
+                    let _ = self.control_tx.send(LayoutParam::DragNode(idx, mouse_world_pos));
                 } else if self.is_dragging_camera {
                     if let Some(last_pos) = self.last_cursor_pos {
                         let delta = current_pos - last_pos;
@@ -277,10 +555,8 @@ impl ApplicationHandler for App {
                     match update {
                         LayoutUpdate::Positions(positions) => {
                             for (i, &pos) in positions.iter().enumerate() {
-                                if self.is_dragging_node {
-                                    if let Some(dragged_idx) = self.selected_node {
-                                        if i == dragged_idx { continue; }
-                                    }
+                                if let Some(dragged_idx) = self.dragging_node {
+                                    if i == dragged_idx { continue; }
                                 }
                                 self.graph.nodes[i].data.position = pos;
                             }
@@ -327,6 +603,7 @@ impl ApplicationHandler for App {
                             
                             // Switch to Communities tab
                             self.selected_tab = 1;
+                            self.filter_state.dirty = true;
                         }
                     }
                 }
@@ -364,10 +641,24 @@ impl ApplicationHandler for App {
                             // Check visibility
                             let mut is_dimmed = false;
                             
+                            // 1. Degree Filter
+                            // Optimization: We compute degree here. If we do it often, maybe cache it?
+                            // But neighbors() is fast-ish (slice access).
+                            let degree = self.graph.neighbors(i).len() as f32;
+                            if degree < self.filter_state.min_degree || degree > self.filter_state.max_degree {
+                                return None;
+                            }
+                            
+                            // 2. Community Filter
                             if !self.community_assignments.is_empty() {
                                 if let Some(&comm_id) = self.community_assignments.get(i) {
                                     if let Some(info) = self.communities.get(&comm_id) {
                                         if !info.visible {
+                                            return None;
+                                        }
+                                        
+                                        // Size filter
+                                        if info.count < self.filter_state.min_community_size || info.count > self.filter_state.max_community_size {
                                             return None;
                                         }
                                         
@@ -383,16 +674,22 @@ impl ApplicationHandler for App {
                             
                             // Check highlighting (Node Neighbors)
                             if !is_dimmed && self.highlight_neighbors {
-                                if let Some(hovered_node_idx) = self.hovered_node {
-                                    if i != hovered_node_idx {
-                                        // Check if neighbor
-                                        // This is O(N) inside the loop, making it O(N*VisibleN).
-                                        // Ideally we should pre-calculate the set of highlighted nodes for the frame.
-                                        // But for now, let's just check neighbors.
-                                        // Optimization: `self.graph.neighbors(hovered_node_idx).contains(&i)` is O(Degree).
-                                        // Since max degree is usually small relative to N, this is okay.
-                                        // Actually `neighbors` returns a slice, so `contains` is linear scan of neighbors.
-                                        let neighbors = self.graph.neighbors(hovered_node_idx);
+                                if let Some(selected_idx) = self.selected_node {
+                                    // Selection Mode:
+                                    // 1. Highlight selected node and its neighbors
+                                    // 2. Highlight the hovered node (but NOT its neighbors)
+                                    let neighbors = self.graph.neighbors(selected_idx);
+                                    let is_selected_group = i == selected_idx || neighbors.contains(&i);
+                                    let is_hovered = Some(i) == self.hovered_node;
+                                    
+                                    if !is_selected_group && !is_hovered {
+                                        is_dimmed = true;
+                                    }
+                                } else if let Some(hovered_idx) = self.hovered_node {
+                                    // Hover Mode (No selection):
+                                    // Highlight hovered node and its neighbors
+                                    if i != hovered_idx {
+                                        let neighbors = self.graph.neighbors(hovered_idx);
                                         if !neighbors.contains(&i) {
                                             is_dimmed = true;
                                         }
@@ -438,10 +735,25 @@ impl ApplicationHandler for App {
                         // Check visibility of endpoints
                         let mut is_dimmed = false;
                         
+                        // Check Degree Filter
+                        let s_degree = self.graph.neighbors(edge.source).len() as f32;
+                        let t_degree = self.graph.neighbors(edge.target).len() as f32;
+                        
+                        if s_degree < self.filter_state.min_degree || s_degree > self.filter_state.max_degree {
+                            continue;
+                        }
+                        if t_degree < self.filter_state.min_degree || t_degree > self.filter_state.max_degree {
+                            continue;
+                        }
+
+                        let mut s_comm_opt = None;
+                        let mut t_comm_opt = None;
+                        
                         if !self.community_assignments.is_empty() {
-                            let s_comm_opt = self.community_assignments.get(edge.source);
-                            let t_comm_opt = self.community_assignments.get(edge.target);
+                            s_comm_opt = self.community_assignments.get(edge.source);
+                            t_comm_opt = self.community_assignments.get(edge.target);
                             
+                            // Check Community Visibility
                             let s_visible = s_comm_opt.and_then(|c| self.communities.get(c)).map(|i| i.visible).unwrap_or(true);
                             let t_visible = t_comm_opt.and_then(|c| self.communities.get(c)).map(|i| i.visible).unwrap_or(true);
                             
@@ -449,23 +761,47 @@ impl ApplicationHandler for App {
                                 continue;
                             }
                             
-                            // Check highlighting (Community)
-                            if let Some(hovered_id) = self.hovered_community {
-                                let s_in_comm = s_comm_opt.map_or(false, |&c| c == hovered_id);
-                                let t_in_comm = t_comm_opt.map_or(false, |&c| c == hovered_id);
-                                
-                                // Highlight if connected to the community
-                                if !s_in_comm && !t_in_comm {
-                                    is_dimmed = true;
-                                }
+                            // Check Community Size Filter
+                             if let Some(&c) = s_comm_opt {
+                                 if let Some(info) = self.communities.get(&c) {
+                                     if info.count < self.filter_state.min_community_size || info.count > self.filter_state.max_community_size {
+                                         continue;
+                                     }
+                                 }
+                             }
+                             if let Some(&c) = t_comm_opt {
+                                 if let Some(info) = self.communities.get(&c) {
+                                     if info.count < self.filter_state.min_community_size || info.count > self.filter_state.max_community_size {
+                                         continue;
+                                     }
+                                 }
+                             }
+                        }
+                        
+                        // Check highlighting (Community)
+                        if let Some(hovered_id) = self.hovered_community {
+                            let s_in_comm = s_comm_opt.map_or(false, |&c| c == hovered_id);
+                            let t_in_comm = t_comm_opt.map_or(false, |&c| c == hovered_id);
+                            
+                            // Highlight if connected to the community
+                            if !s_in_comm && !t_in_comm {
+                                is_dimmed = true;
                             }
                         }
+
                         
                         // Check highlighting (Node Neighbors)
                         if !is_dimmed && self.highlight_neighbors {
-                            if let Some(hovered_node_idx) = self.hovered_node {
-                                // Highlight only edges connected to the hovered node
-                                if edge.source != hovered_node_idx && edge.target != hovered_node_idx {
+                            if let Some(selected_idx) = self.selected_node {
+                                // Selection Mode:
+                                // Only highlight edges connected to the selected node
+                                if edge.source != selected_idx && edge.target != selected_idx {
+                                    is_dimmed = true;
+                                }
+                            } else if let Some(hovered_idx) = self.hovered_node {
+                                // Hover Mode:
+                                // Highlight edges connected to hovered node
+                                if edge.source != hovered_idx && edge.target != hovered_idx {
                                     is_dimmed = true;
                                 }
                             }
@@ -492,7 +828,25 @@ impl ApplicationHandler for App {
                         let raw_input = egui_state.take_egui_input(window);
                         self.egui_ctx.begin_frame(raw_input);
                         
-                        egui::Window::new("Rebar Stats").show(&self.egui_ctx, |ui| {
+                        egui::Window::new("Rebar").show(&self.egui_ctx, |ui| {
+                            // Selection UI
+                            if let Some(selected_idx) = self.selected_node {
+                                if let Some(node) = self.graph.nodes.get(selected_idx) {
+                                    ui.group(|ui| {
+                                        ui.heading("Selected Node");
+                                        ui.label(format!("ID: {}", node.id));
+                                        if !node.label.is_empty() {
+                                            ui.label(format!("Label: {}", node.label));
+                                        }
+                                        ui.label(format!("Degree: {}", self.graph.neighbors(selected_idx).len()));
+                                        if let Some(&comm_id) = self.community_assignments.get(selected_idx) {
+                                            ui.label(format!("Community: {}", comm_id));
+                                        }
+                                    });
+                                    ui.separator();
+                                }
+                            }
+
                             ui.horizontal(|ui| {
                             if ui.selectable_label(self.selected_tab == 0, "Layout").clicked() {
                                 self.selected_tab = 0;
@@ -503,6 +857,9 @@ impl ApplicationHandler for App {
                             if ui.selectable_label(self.selected_tab == 2, "Visuals").clicked() {
                                 self.selected_tab = 2;
                             }
+                            if ui.selectable_label(self.selected_tab == 3, "Filters").clicked() {
+                                self.selected_tab = 3;
+                            }
                         });
                         ui.separator();
 
@@ -510,6 +867,23 @@ impl ApplicationHandler for App {
                             match self.selected_tab {
                                 0 => {
                                     // LAYOUT TAB
+                                    ui.horizontal(|ui| {
+                                        if self.layout_running {
+                                            if ui.add(egui::Button::new("⏹ Stop Layout").fill(egui::Color32::from_rgb(200, 50, 50))).clicked() {
+                                                self.layout_running = false;
+                                                let _ = self.control_tx.send(LayoutParam::SetRunning(false));
+                                            }
+                                            ui.label("Running...");
+                                        } else {
+                                            if ui.add(egui::Button::new("▶ Run Layout").fill(egui::Color32::from_rgb(50, 200, 50))).clicked() {
+                                                self.layout_running = true;
+                                                let _ = self.control_tx.send(LayoutParam::SetRunning(true));
+                                            }
+                                            ui.label("Stopped");
+                                        }
+                                    });
+                                    ui.separator();
+                                    
                                     ui.label("Layout Algorithm:");
                                     if ui.radio_value(&mut self.layout_mode, LayoutType::FruchtermanReingold, "Fruchterman-Reingold").changed() {
                                         let _ = self.control_tx.send(LayoutParam::SwitchLayout(LayoutType::FruchtermanReingold));
@@ -522,10 +896,10 @@ impl ApplicationHandler for App {
                                     
                                     if self.layout_mode == LayoutType::ForceAtlas2 {
                                         ui.label("ForceAtlas2 Params:");
-                                        if ui.add(egui::Slider::new(&mut self.fa2_scaling, 1.0..=100.0).text("Scaling")).changed() {
+                                        if ui.add(egui::Slider::new(&mut self.fa2_scaling, 1.0..=500.0).text("Scaling")).changed() {
                                             let _ = self.control_tx.send(LayoutParam::UpdateFA2Scaling(self.fa2_scaling));
                                         }
-                                        if ui.add(egui::Slider::new(&mut self.fa2_gravity, 0.1..=10.0).text("Gravity")).changed() {
+                                        if ui.add(egui::Slider::new(&mut self.fa2_gravity, 0.01..=10.0).text("Gravity")).changed() {
                                             let _ = self.control_tx.send(LayoutParam::UpdateFA2Gravity(self.fa2_gravity));
                                         }
                                     } else {
@@ -575,7 +949,11 @@ impl ApplicationHandler for App {
                                             let max_dim = size.x.max(size.y).max(100.0);
                                             
                                             // 1.2 padding factor
-                                            self.camera.zoom = 1.0 / (max_dim * 0.6); 
+                                            let target_zoom = 1.0 / (max_dim * 0.6);
+                                            
+                                            // Adjust min_zoom to allow zooming out a bit more than fit
+                                            self.camera.min_zoom = (target_zoom * 0.5).min(1e-5);
+                                            self.camera.zoom = target_zoom;
                                         }
                                     }
                                     
@@ -592,6 +970,23 @@ impl ApplicationHandler for App {
                                     if ui.button("Detect Communities").clicked() {
                                         let _ = self.control_tx.send(LayoutParam::RunLeiden(self.leiden_gamma));
                                     }
+                                    
+                                    if ui.button("Reset Communities").clicked() {
+                                        self.community_assignments.clear();
+                                        self.communities.clear();
+                                        self.hovered_community = None;
+                                        self.filter_state.min_community_size = 0;
+                                        self.filter_state.max_community_size = usize::MAX;
+                                        
+                                        // Reset node colors
+                                        for node in &mut self.graph.nodes {
+                                            node.data.color = [1.0, 1.0, 1.0, 1.0];
+                                        }
+                                        
+                                        // Update filters (to clear any hiding)
+                                        App::update_layout_filters(&self.graph, &self.communities, &self.community_assignments, &self.filter_state, &self.control_tx);
+                                    }
+                                    
                                     ui.separator();
                                     
                                     if self.communities.is_empty() {
@@ -615,7 +1010,14 @@ impl ApplicationHandler for App {
                                                     comm.color = color;
                                                     changed = true;
                                                 }
-                                                ui.label(format!("ID: {} ({} nodes)", comm.id, comm.count));
+                                                let is_filtered = comm.count < self.filter_state.min_community_size || comm.count > self.filter_state.max_community_size;
+                                                
+                                                let text = format!("ID: {} ({} nodes)", comm.id, comm.count);
+                                                if is_filtered {
+                                                    ui.label(egui::RichText::new(text).strikethrough().color(egui::Color32::GRAY));
+                                                } else {
+                                                    ui.label(text);
+                                                }
                                             });
                                             
                                             if response.response.hovered() {
@@ -624,17 +1026,22 @@ impl ApplicationHandler for App {
                                         }
                                         
                                         // Update hovered community from UI
+                                        // Update hovered community from UI
                                         if ui_hovered_comm.is_some() {
                                             self.hovered_community = ui_hovered_comm;
-                                        } else if self.hovered_node.is_some() {
-                                            // Update from Graph hover
-                                            if let Some(node_idx) = self.hovered_node {
+                                        } else {
+                                            // Update from Graph hover or selection
+                                            let source_node = self.hovered_node.or(self.selected_node);
+                                            
+                                            if let Some(node_idx) = source_node {
                                                 if let Some(&comm_id) = self.community_assignments.get(node_idx) {
                                                     self.hovered_community = Some(comm_id);
+                                                } else {
+                                                    self.hovered_community = None;
                                                 }
+                                            } else {
+                                                self.hovered_community = None;
                                             }
-                                        } else {
-                                            self.hovered_community = None;
                                         }
                                         
                                         if changed {
@@ -660,6 +1067,7 @@ impl ApplicationHandler for App {
                                     // Let's check LayoutParam. It has no EdgeScale variant.
                                     // So edge_scale is local to App.
                                     ui.add(egui::Slider::new(&mut self.edge_scale, 0.1..=5.0).text("Edge Scale"));
+                                    ui.add(egui::Slider::new(&mut self.text_scale, 0.1..=5.0).text("Text Scale"));
                                     
                                     if ui.checkbox(&mut self.scale_by_degree, "Scale Nodes by Degree").changed() {
                                         let _ = self.control_tx.send(LayoutParam::ScaleByDegree(self.scale_by_degree));
@@ -668,11 +1076,230 @@ impl ApplicationHandler for App {
                                     ui.separator();
                                     ui.label("Highlighting:");
                                     ui.checkbox(&mut self.highlight_neighbors, "Highlight Neighbors on Hover");
+                                    ui.checkbox(&mut self.show_node_ids, "Show Node ID on Hover");
+                                }
+                                
+                                3 => {
+                                    // FILTERS TAB
+                                    App::update_histograms(&self.graph, &self.communities, &mut self.filter_state);
+                                    
+                                    ui.heading("Node Filters");
+                                    ui.label("Filter nodes to hide them and exclude from layout.");
+                                    ui.separator();
+
+
+                                    let highlight_color = egui::Color32::from_rgba_unmultiplied(200, 200, 250, 10);
+                                    let chart_height = 50.0;
+
+                                    
+                                    // Degree Filter
+                                    ui.label(format!("Degree Range: {:.0} - {:.0}", self.filter_state.min_degree, self.filter_state.max_degree));
+                                    
+                                    ui.horizontal(|ui| {
+                                        if ui.add(egui::DragValue::new(&mut self.filter_state.min_degree).range(self.filter_state.data_min_degree..=self.filter_state.max_degree).speed(1.0)).changed() {
+                                            App::update_layout_filters(&self.graph, &self.communities, &self.community_assignments, &self.filter_state, &self.control_tx);
+                                        }
+                                        ui.label("Min");
+                                        if ui.add(egui::DragValue::new(&mut self.filter_state.max_degree).range(self.filter_state.min_degree..=self.filter_state.data_max_degree).speed(1.0)).changed() {
+                                            App::update_layout_filters(&self.graph, &self.communities, &self.community_assignments, &self.filter_state, &self.control_tx);
+                                        }
+                                        ui.label("Max");
+                                        if ui.button("Reset").clicked() {
+                                            self.filter_state.min_degree = self.filter_state.data_min_degree;
+                                            self.filter_state.max_degree = self.filter_state.data_max_degree;
+                                            App::update_layout_filters(&self.graph, &self.communities, &self.community_assignments, &self.filter_state, &self.control_tx);
+                                        }
+                                    });
+                                    
+                                    self.filter_state.drag_start_degree = Self::draw_filter_plot(
+                                        ui,
+                                        "degree_hist",
+                                        self.filter_state.degree_histogram.clone(),
+                                        chart_height,
+                                        egui::Color32::LIGHT_BLUE,
+                                        highlight_color,
+                                        self.filter_state.min_degree..=self.filter_state.max_degree,
+                                        self.filter_state.data_min_degree..=self.filter_state.data_max_degree,
+                                        self.filter_state.max_degree_count,
+                                        self.filter_state.degree_bin_width as f64,
+                                        self.filter_state.drag_start_degree,
+                                        |min, max| {
+                                            self.filter_state.min_degree = min;
+                                            self.filter_state.max_degree = max;
+                                            App::update_layout_filters(&self.graph, &self.communities, &self.community_assignments, &self.filter_state, &self.control_tx);
+                                        }
+                                    );
+                                        
+                                    ui.separator();
+                                    
+                                    // Community Size Filter
+                                    if !self.communities.is_empty() {
+                                        ui.label(format!("Community Size Range: {} - {}", self.filter_state.min_community_size, self.filter_state.max_community_size));
+                                        
+                                        ui.horizontal(|ui| {
+                                            if ui.add(egui::DragValue::new(&mut self.filter_state.min_community_size).range(0..=self.filter_state.max_community_size).speed(1.0)).changed() {
+                                                App::update_layout_filters(&self.graph, &self.communities, &self.community_assignments, &self.filter_state, &self.control_tx);
+                                            }
+                                            ui.label("Min");
+                                            if ui.add(egui::DragValue::new(&mut self.filter_state.max_community_size).range(self.filter_state.min_community_size..=self.filter_state.data_max_community_size).speed(1.0)).changed() {
+                                                App::update_layout_filters(&self.graph, &self.communities, &self.community_assignments, &self.filter_state, &self.control_tx);
+                                            }
+                                            ui.label("Max");
+                                            if ui.button("Reset").clicked() {
+                                                self.filter_state.min_community_size = 0;
+                                                self.filter_state.max_community_size = self.filter_state.data_max_community_size;
+                                                App::update_layout_filters(&self.graph, &self.communities, &self.community_assignments, &self.filter_state, &self.control_tx);
+                                            }
+                                        });
+                                        
+                                        self.filter_state.drag_start_community = Self::draw_filter_plot(
+                                            ui,
+                                            "comm_hist",
+                                            self.filter_state.community_size_histogram.clone(),
+                                            chart_height,
+                                            egui::Color32::LIGHT_GREEN,
+                                            highlight_color,
+                                            self.filter_state.min_community_size as f32..=self.filter_state.max_community_size as f32,
+                                            0.0..=self.filter_state.data_max_community_size as f32,
+                                            self.filter_state.max_community_count,
+                                            self.filter_state.community_bin_width as f64,
+                                            self.filter_state.drag_start_community,
+                                            |min, max| {
+                                                self.filter_state.min_community_size = min as usize;
+                                                self.filter_state.max_community_size = max as usize;
+                                                App::update_layout_filters(&self.graph, &self.communities, &self.community_assignments, &self.filter_state, &self.control_tx);
+                                            }
+                                        );
+                                    } else {
+                                        ui.label("Run Community Detection to filter by community size.");
+                                    }
                                 }
                                 _ => {}
                             }
                         });
                         });
+                        
+                        // Draw Node IDs
+                        if self.show_node_ids {
+                            let painter = self.egui_ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("labels")));
+                            let view_proj = self.camera.build_view_projection_matrix();
+                            let screen_size = Vec2::new(renderer.size.width as f32, renderer.size.height as f32);
+                            let scale_factor = window.scale_factor() as f32;
+                            
+                            // Define closure to draw label
+                            let draw_label = |node_idx: usize, painter: &egui::Painter| {
+                                if let Some(node) = self.graph.nodes.get(node_idx) {
+                                    // Check visibility
+                                    let degree = self.graph.neighbors(node_idx).len() as f32;
+                                    if degree < self.filter_state.min_degree || degree > self.filter_state.max_degree {
+                                        return;
+                                    }
+                                    
+                                    if !self.community_assignments.is_empty() {
+                                        if let Some(&comm_id) = self.community_assignments.get(node_idx) {
+                                            if let Some(info) = self.communities.get(&comm_id) {
+                                                if !info.visible {
+                                                    return;
+                                                }
+                                                if info.count < self.filter_state.min_community_size || info.count > self.filter_state.max_community_size {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // World -> NDC
+                                    let pos_world = node.data.position;
+                                    let pos_ndc = view_proj.project_point3(Vec3::new(pos_world.x, pos_world.y, 0.0));
+                                    
+                                    // Check if behind camera (though orthographic usually doesn't have this issue unless clipped)
+                                    // NDC z is 0 to 1 (wgpu) or -1 to 1 (gl)? 
+                                    // WGPU uses 0 to 1 for Z.
+                                    // But project_point3 returns normalized coordinates.
+                                    
+                                    // NDC -> Screen
+                                    // NDC x: -1 to 1 -> 0 to width
+                                    // NDC y: -1 to 1 -> height to 0 (Y up in NDC, Y down in Screen)
+                                    // Wait, egui Y is down. WGPU NDC Y is up.
+                                    
+                                    let x = (pos_ndc.x + 1.0) * 0.5 * screen_size.x;
+                                    let y = (1.0 - pos_ndc.y) * 0.5 * screen_size.y;
+                                    
+                                    let screen_pos = egui::Pos2::new(x / scale_factor, y / scale_factor);
+                                    
+                                    let text = if node.label.is_empty() {
+                                        format!("{}", node.id)
+                                    } else {
+                                        node.label.clone()
+                                    };
+                                    
+                                    // Calculate font size
+                                    // 1. Determine points per world unit
+                                    // NDC height is 2.0 (-1 to 1)
+                                    // Screen height in points is screen_size.y / scale_factor
+                                    // 1 NDC unit = (screen_size.y / scale_factor) / 2.0 points
+                                    // 1 World unit = camera.zoom NDC units
+                                    let screen_height_points = screen_size.y / scale_factor;
+                                    let points_per_world_unit = self.camera.zoom * screen_height_points * 0.5;
+                                    
+                                    let degree_scale = if self.scale_by_degree {
+                                        (degree + 1.0).ln()
+                                    } else {
+                                        1.0
+                                    };
+                                    
+                                    // Base font size in WORLD UNITS (relative to node radius of ~5.0)
+                                    // Let's say we want text to be about 2.5x the node radius by default
+                                    let base_size_world = 12.0; 
+                                    
+                                    let font_size = (base_size_world * points_per_world_unit * self.text_scale * self.node_scale * degree_scale).max(1.0);
+                                    
+                                    // Determine text color
+                                    let mut text_color = egui::Color32::WHITE;
+                                    if let Some(&comm_id) = self.community_assignments.get(node_idx) {
+                                        if let Some(info) = self.communities.get(&comm_id) {
+                                            let [r, g, b, _] = info.color;
+                                            text_color = egui::Color32::from_rgb(
+                                                (r * 255.0) as u8,
+                                                (g * 255.0) as u8,
+                                                (b * 255.0) as u8,
+                                            );
+                                        }
+                                    }
+
+                                    // Draw background rect for readability
+                                    let galley = painter.layout_no_wrap(text, egui::FontId::proportional(font_size), text_color);
+                                    let rect = galley.rect.translate(screen_pos - galley.rect.center_bottom());
+                                    let padded_rect = rect.expand(2.0);
+                                    
+                                    painter.rect_filled(padded_rect, 2.0, egui::Color32::from_black_alpha(150));
+                                    painter.galley(rect.min, galley, text_color);
+                                }
+                            };
+                            
+                            if let Some(selected_idx) = self.selected_node {
+                                // Selection Mode
+                                // Draw selected node and neighbors
+                                for &neighbor in self.graph.neighbors(selected_idx) {
+                                    draw_label(neighbor, &painter);
+                                }
+                                draw_label(selected_idx, &painter);
+                                
+                                // Also draw hovered node if it's not already drawn
+                                if let Some(hovered_idx) = self.hovered_node {
+                                    let neighbors = self.graph.neighbors(selected_idx);
+                                    if hovered_idx != selected_idx && !neighbors.contains(&hovered_idx) {
+                                        draw_label(hovered_idx, &painter);
+                                    }
+                                }
+                            } else if let Some(hovered_idx) = self.hovered_node {
+                                // Hover Mode
+                                for &neighbor in self.graph.neighbors(hovered_idx) {
+                                    draw_label(neighbor, &painter);
+                                }
+                                draw_label(hovered_idx, &painter);
+                            }
+                        }
                         
                         let egui_output = self.egui_ctx.end_frame();
                         
@@ -703,6 +1330,10 @@ impl ApplicationHandler for App {
             window.request_redraw();
         }
     }
+
+
+    
+
 }
 
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [f32; 4] {
@@ -727,44 +1358,125 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [f32; 4] {
     [(r + m), (g + m), (b + m), 1.0]
 }
 
+fn url_decode(s: &str) -> String {
+    let mut bytes = Vec::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let h1 = chars.next();
+            let h2 = chars.next();
+            if let (Some(h1), Some(h2)) = (h1, h2) {
+                if let Ok(byte) = u8::from_str_radix(&format!("{}{}", h1, h2), 16) {
+                    bytes.push(byte);
+                    continue;
+                }
+                // If invalid hex, push the original chars
+                bytes.push(b'%');
+                let mut buf = [0; 4];
+                for &b in h1.encode_utf8(&mut buf).as_bytes() { bytes.push(b); }
+                for &b in h2.encode_utf8(&mut buf).as_bytes() { bytes.push(b); }
+            } else {
+                bytes.push(b'%');
+                if let Some(h) = h1 { 
+                    let mut buf = [0; 4];
+                    for &b in h.encode_utf8(&mut buf).as_bytes() { bytes.push(b); }
+                }
+            }
+        } else {
+            let mut buf = [0; 4];
+            for &b in c.encode_utf8(&mut buf).as_bytes() {
+                bytes.push(b);
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
 fn load_graph_from_file(path: &str) -> std::io::Result<Graph> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
+    use std::collections::HashMap;
     
     println!("Loading graph from {}...", path);
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     
     let mut edges = Vec::new();
-    let mut max_id = 0;
+    let mut node_map: HashMap<String, usize> = HashMap::new();
+    let mut next_id = 0;
+    
+    // Helper to get or create node ID
+    let mut get_id = |name: &str| -> usize {
+        // Decode URL-encoded names (e.g. %20 -> space, %C3%A9 -> é)
+        let decoded_name = url_decode(name);
+        if let Some(&id) = node_map.get(&decoded_name) {
+            id
+        } else {
+            let id = next_id;
+            node_map.insert(decoded_name, id);
+            next_id += 1;
+            id
+        }
+    };
     
     for line in reader.lines() {
         let line = line?;
-        if line.trim().starts_with('#') {
+        if line.trim().starts_with('#') || line.trim().is_empty() {
             continue;
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 2 {
-            if let (Ok(u), Ok(v)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
-                edges.push((u, v));
-                max_id = max_id.max(u).max(v);
+            // Try parsing as usize first (legacy support for numeric edge lists)
+            // But if it fails, treat as string labels
+            let u_str = parts[0];
+            let v_str = parts[1];
+            
+            // Check if they look like numbers
+            let u_is_num = u_str.parse::<usize>().is_ok();
+            let v_is_num = v_str.parse::<usize>().is_ok();
+            
+            if u_is_num && v_is_num {
+                 let u = u_str.parse::<usize>().unwrap();
+                 let v = v_str.parse::<usize>().unwrap();
+                 
+                 // Ensure we map these numbers to our ID space if we are mixing types, 
+                 // but for pure numeric files, we usually want to preserve IDs.
+                 // However, to support mixed or sparse IDs, let's just treat them as labels too?
+                 // Actually, if we treat "1" as a label, it gets mapped to 0.
+                 // This is safer for sparse graphs.
+                 let u_id = get_id(u_str);
+                 let v_id = get_id(v_str);
+                 edges.push((u_id, v_id));
+            } else {
+                // String labels (e.g. wiki-links.tsv)
+                let u_id = get_id(u_str);
+                let v_id = get_id(v_str);
+                edges.push((u_id, v_id));
             }
         }
     }
     
-    let node_count = max_id + 1;
+    let node_count = next_id;
     println!("Graph has {} nodes and {} edges", node_count, edges.len());
     
     let mut graph = Graph::new();
     let mut rng = rand::thread_rng();
     
+    // Create nodes in order of IDs (0 to node_count-1)
+    // We need to reconstruct the label from the map.
+    // Invert the map: ID -> Label
+    let mut id_to_label = vec![String::new(); node_count];
+    for (label, &id) in &node_map {
+        id_to_label[id] = label.clone();
+    }
+    
     // Initialize nodes with random positions
-    for _ in 0..node_count {
+    for i in 0..node_count {
         let pos = Vec2::new(
             rng.gen_range(-1000.0..1000.0),
             rng.gen_range(-1000.0..1000.0),
         );
-        graph.add_node(pos);
+        graph.add_node(pos, id_to_label[i].clone());
     }
     
     for (u, v) in edges {
@@ -818,9 +1530,9 @@ fn main() {
     let graph = if graph.node_count() == 0 {
         let mut graph = Graph::new();
         let mut rng = rand::thread_rng();
-        for _ in 0..100 {
+        for i in 0..100 {
              let pos = Vec2::new(rng.gen_range(-100.0..100.0), rng.gen_range(-100.0..100.0));
-             graph.add_node(pos);
+             graph.add_node(pos, format!("Node {}", i));
         }
         graph
     } else {
@@ -865,10 +1577,16 @@ fn main() {
             state.positions[i] = node.data.position;
         }
         
+        let mut active_mask: Option<Vec<bool>> = None;
+        let mut is_running = true;
+        
         loop {
             // Check for control updates
             while let Ok(param) = control_rx.try_recv() {
                 match param {
+                    LayoutParam::UpdateActiveNodes(mask) => {
+                        active_mask = Some(mask);
+                    }
                     LayoutParam::K(k) => {
                         match &mut active_layout {
                             ActiveLayout::FR(l) => {
@@ -905,23 +1623,26 @@ fn main() {
                                 active_layout = ActiveLayout::FR(FruchtermanReingold::new(50.0));
                             }
                             LayoutType::ForceAtlas2 => {
-                                active_layout = ActiveLayout::FA2(ForceAtlas2::new(50.0));
+                                active_layout = ActiveLayout::FA2(ForceAtlas2::new(100.0));
                             }
                         }
                     }
                     LayoutParam::NodeScale(s) => {
                         if let ActiveLayout::FA2(l) = &mut active_layout {
                             l.node_radius = s;
+                            l.speed = 1.0; // Wake up
                         }
                     }
                     LayoutParam::PreventOverlap(b) => {
                         if let ActiveLayout::FA2(l) = &mut active_layout {
                             l.prevent_overlap = b;
+                            l.speed = 1.0; // Wake up
                         }
                     }
                     LayoutParam::ScaleByDegree(b) => {
                         if let ActiveLayout::FA2(l) = &mut active_layout {
                             l.scale_by_degree = b;
+                            l.speed = 1.0; // Wake up
                         }
                     }
                     LayoutParam::RunLeiden(gamma) => {
@@ -962,6 +1683,9 @@ fn main() {
                             l.k = k;
                         }
                     }
+                    LayoutParam::SetRunning(running) => {
+                        is_running = running;
+                    }
                 }
             }
             
@@ -971,9 +1695,11 @@ fn main() {
                 state.velocities[idx] = Vec2::ZERO;
             }
             
-            match &mut active_layout {
-                ActiveLayout::FR(l) => l.step(&graph_clone, &mut state),
-                ActiveLayout::FA2(l) => l.step(&graph_clone, &mut state),
+            if is_running {
+                match &mut active_layout {
+                    ActiveLayout::FR(l) => l.step(&graph_clone, &mut state, active_mask.as_deref()),
+                    ActiveLayout::FA2(l) => l.step(&graph_clone, &mut state, active_mask.as_deref()),
+                }
             }
             
             // Enforce pinned positions after step (so they don't move)
@@ -1002,12 +1728,15 @@ enum LayoutParam {
     NodeScale(f32),
     PreventOverlap(bool),
     ScaleByDegree(bool),
+    SetRunning(bool),
     RunLeiden(f32), // Gamma
     UpdateFA2Scaling(f32),
     UpdateFA2Gravity(f32),
     UpdateFRTemperature(f32),
     UpdateFRCooling(f32),
+
     UpdateFRK(f32),
+    UpdateActiveNodes(Vec<bool>),
 }
 
 struct CommunityInfo {

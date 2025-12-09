@@ -36,7 +36,7 @@ impl FruchtermanReingold {
         }
     }
 
-    pub fn step(&mut self, graph: &Graph, state: &mut LayoutState) {
+    pub fn step(&mut self, graph: &Graph, state: &mut LayoutState, active_mask: Option<&[bool]>) {
         let node_count = graph.node_count();
         if node_count == 0 {
             return;
@@ -55,7 +55,10 @@ impl FruchtermanReingold {
         // Find bounds
         let mut min_pos = Vec2::splat(f32::MAX);
         let mut max_pos = Vec2::splat(f32::MIN);
-        for &pos in &state.positions {
+        for (i, &pos) in state.positions.iter().enumerate() {
+            if let Some(mask) = active_mask {
+                if !mask[i] { continue; }
+            }
             min_pos = min_pos.min(pos);
             max_pos = max_pos.max(pos);
         }
@@ -63,57 +66,77 @@ impl FruchtermanReingold {
         let bounds = AABB::new(min_pos - Vec2::splat(10.0), max_pos + Vec2::splat(10.0));
         let mut quadtree = QuadTree::new(bounds);
         for (i, &pos) in state.positions.iter().enumerate() {
+            if let Some(mask) = active_mask {
+                if !mask[i] { continue; }
+            }
             quadtree.insert(pos, i);
         }
         quadtree.calculate_mass();
         
         // 2. Calculate forces
-        let mut displacements = vec![Vec2::ZERO; node_count];
+        use rayon::prelude::*;
         
-        // Repulsion (Barnes-Hut)
-        // Parallelize this? (Need rayon or crossbeam, but for now serial is fine to test correctness)
-        for i in 0..node_count {
-            let pos = state.positions[i];
-            // Use QuadTree to calculate repulsion
-            // We need to pass the repulsion constant (k^2 / d) logic into calculate_repulsion or adapt it.
-            // The current calculate_repulsion uses a hardcoded strength. Let's make it configurable or pass it.
-            // F_rep = k^2 / d
-            // In calculate_repulsion: force += delta * (strength * mass / dist^2);
-            // So strength should be k^2.
-            
-            let repulsion = quadtree.calculate_repulsion(pos, 0.7, self.k * self.k);
-            
-            displacements[i] += repulsion;
-        }
-        
-        // Attraction (Edges)
-        for edge in &graph.edges {
-            let u = edge.source;
-            let v = edge.target;
-            let delta = state.positions[v] - state.positions[u];
-            let dist = delta.length();
-            if dist > 0.0 {
-                // F_att = d^2 / k
-                let force = delta.normalize() * (dist * dist / self.k);
-                displacements[u] += force;
-                displacements[v] -= force;
+        let displacements: Vec<Vec2> = (0..node_count).into_par_iter().map(|i| {
+            if let Some(mask) = active_mask {
+                if !mask[i] { return Vec2::ZERO; }
             }
-        }
+            
+            let mut disp = Vec2::ZERO;
+            let pos = state.positions[i];
+            
+            // Repulsion (Barnes-Hut)
+            let repulsion = quadtree.calculate_repulsion(pos, 0.7, self.k * self.k);
+            disp += repulsion;
+            
+            // Attraction (Edges)
+            // Iterate neighbors
+            for &neighbor_idx in graph.neighbors(i) {
+                if let Some(mask) = active_mask {
+                    if !mask[neighbor_idx] { continue; }
+                }
+                
+                let other_pos = state.positions[neighbor_idx];
+                let delta = other_pos - pos;
+                let dist = delta.length();
+                if dist > 0.0 {
+                    // F_att = d^2 / k
+                    let force = delta.normalize() * (dist * dist / self.k);
+                    // In FR, attraction pulls u towards v.
+                    // Here we are node i. Neighbor pulls us.
+                    disp += force;
+                }
+            }
+            
+            disp
+        }).collect();
         
         // 3. Apply forces
-        for i in 0..node_count {
+        let (new_positions, new_temperatures): (Vec<Vec2>, Vec<f32>) = (0..node_count).into_par_iter().map(|i| {
+            let mut pos = state.positions[i];
+            let mut temp = state.temperatures[i];
+            
+            if let Some(mask) = active_mask {
+                if !mask[i] { return (pos, temp); }
+            }
+            
             let disp = displacements[i];
+            
             let dist = disp.length();
             if dist > 0.0 {
                 // Use max of global temperature and local node temperature
-                let limit = self.temperature.max(state.temperatures[i]);
+                let limit = self.temperature.max(temp);
                 let limited_dist = dist.min(limit);
-                state.positions[i] += disp.normalize() * limited_dist;
+                pos += disp.normalize() * limited_dist;
             }
             
             // Cool down local temperature
-            state.temperatures[i] *= self.cooling;
-        }
+            temp *= self.cooling;
+            
+            (pos, temp)
+        }).unzip();
+        
+        state.positions = new_positions;
+        state.temperatures = new_temperatures;
         
         // 4. Cool down
         self.temperature *= self.cooling;
@@ -135,11 +158,11 @@ pub struct ForceAtlas2 {
 }
 
 impl ForceAtlas2 {
-    pub fn new(_scaling: f32) -> Self {
+    pub fn new(scaling: f32) -> Self {
         Self {
             iterations: 0,
             gravity: 1.0,
-            scaling: 10.0, // Reduced from scaling arg (usually 50.0) to prevent explosion
+            scaling, // Use the passed argument
             speed: 1.0,
             cooling: 0.99, // Slow cooling
             prevent_overlap: false,
@@ -149,77 +172,103 @@ impl ForceAtlas2 {
         }
     }
 
-    pub fn step(&mut self, graph: &Graph, state: &mut LayoutState) {
+    pub fn step(&mut self, graph: &Graph, state: &mut LayoutState, active_mask: Option<&[bool]>) {
         let node_count = graph.node_count();
         if node_count == 0 { return; }
 
         // 1. Build QuadTree for Barnes-Hut
         let mut min_pos = Vec2::splat(f32::MAX);
         let mut max_pos = Vec2::splat(f32::MIN);
-        for &pos in &state.positions {
+        for (i, &pos) in state.positions.iter().enumerate() {
+            if let Some(mask) = active_mask {
+                if !mask[i] { continue; }
+            }
             min_pos = min_pos.min(pos);
             max_pos = max_pos.max(pos);
         }
         let bounds = AABB::new(min_pos - Vec2::splat(10.0), max_pos + Vec2::splat(10.0));
         let mut quadtree = QuadTree::new(bounds);
         for (i, &pos) in state.positions.iter().enumerate() {
+            if let Some(mask) = active_mask {
+                if !mask[i] { continue; }
+            }
             quadtree.insert(pos, i);
         }
         quadtree.calculate_mass();
 
-        let mut forces = vec![Vec2::ZERO; node_count];
-
-        // 2. Repulsion (Barnes-Hut)
-        // FA2 Repulsion: F = kr * (n1 + 1) * (n2 + 1) / d
-        // We approximate mass as (degree + 1).
-        // Our QuadTree currently stores mass as 1.0 per node.
-        // We need to update QuadTree to support variable mass or just use uniform mass for now.
-        // For standard FA2, mass is degree+1.
-        // Let's stick to uniform mass for now to reuse existing QuadTree without major refactor,
-        // or just assume mass=1 for repulsion which is "Dissuade Hubs" mode = false.
+        // 2. Repulsion (Barnes-Hut) & 3. Gravity & 4. Attraction
+        // We calculate all forces in parallel
         
-        for i in 0..node_count {
-            let pos = state.positions[i];
-            // FA2 uses linear repulsion in some modes, but standard is 1/d.
-            // Our calculate_repulsion does k^2 / d.
-            // Let's use it with scaling^2.
-            let repulsion = quadtree.calculate_repulsion(pos, 0.7, self.scaling * self.scaling);
+        use rayon::prelude::*;
+        
+        let forces: Vec<Vec2> = (0..node_count).into_par_iter().map(|i| {
+            if let Some(mask) = active_mask {
+                if !mask[i] { return Vec2::ZERO; }
+            }
             
-            // "Dissuade Hubs" approximation: Scale repulsion by degree.
-            // This pushes hubs apart more strongly.
-            let degree = graph.neighbors(i).len() as f32;
-            forces[i] += repulsion * (degree + 1.0) * 0.5; 
-        }
-
-        // 3. Gravity
-        for i in 0..node_count {
+            let mut force = Vec2::ZERO;
             let pos = state.positions[i];
+            
+            // Repulsion
+            let repulsion = quadtree.calculate_repulsion(pos, 0.7, self.scaling * self.scaling);
+            let degree = graph.neighbors(i).len() as f32;
+            force += repulsion * (degree + 1.0) * 0.5;
+            
+            // Gravity
             let dist = pos.length();
             if dist > 0.0 {
-            // Stronger gravity for FA2 to keep it compact
-            forces[i] -= pos.normalize() * (dist * self.gravity * 1.0); 
-        }    }
-        
-
-        // 4. Attraction (Edges)
-        // FA2 Attraction: F = d (linear)
-        for edge in &graph.edges {
-            let u = edge.source;
-            let v = edge.target;
-            let delta = state.positions[v] - state.positions[u];
-            let dist = delta.length();
-            if dist > 0.0 {
-                // Linear attraction: F = dist
-                let force = delta.normalize() * dist; 
-                forces[u] += force;
-                forces[v] -= force;
+                force -= pos.normalize() * (dist * self.gravity * 1.0);
             }
-        }
+            
+            // Attraction
+            for &neighbor_idx in graph.neighbors(i) {
+                if let Some(mask) = active_mask {
+                    if !mask[neighbor_idx] { continue; }
+                }
+                
+                let other_pos = state.positions[neighbor_idx];
+                let delta = other_pos - pos;
+                let dist = delta.length();
+                if dist > 0.0 {
+                    // Linear attraction: F = dist
+                    // Direction is towards neighbor (delta)
+                    force += delta.normalize() * dist;
+                }
+            }
+            
+            force
+        }).collect();
 
         // 5. Apply Forces (Global Speed)
         // 5. Apply Forces (Adaptive Local Speed)
-        for i in 0..node_count {
-            let force = forces[i];
+        // 5. Apply Forces (Adaptive Local Speed)
+        // We need to update positions, old_forces.
+        // state.positions, state.old_forces are Vecs.
+        // We can use par_iter_mut on a zipped iterator or just iterate indices if we had a parallel zip mut.
+        // Rayon supports par_iter_mut on slices.
+        
+        // We need to access forces[i] (read), old_forces[i] (read/write), positions[i] (read/write), graph.neighbors(i) (read).
+        // Since we need random access to graph neighbors, maybe just par_iter over indices and use UnsafeCell or split slices?
+        // Actually, we can just collect the new positions and old_forces and then replace?
+        // Or use `par_iter_mut` on `state.positions` zipped with `state.old_forces` and `forces`.
+        
+        // Let's use a parallel iterator over the range and update a new vector of positions, then swap.
+        // Or better, use `par_iter_mut` on a struct if we can?
+        // Simplest: Compute new positions and new old_forces in parallel, then replace.
+        
+        let (new_positions, new_old_forces): (Vec<Vec2>, Vec<Vec2>) = (0..node_count).into_par_iter().map(|i| {
+            let mut pos = state.positions[i];
+            let mut force = forces[i]; // Default force
+            
+            if let Some(mask) = active_mask {
+                if !mask[i] { 
+                    // Return current pos and zero force (or old force?)
+                    // If we return zero force, it resets momentum.
+                    return (pos, Vec2::ZERO); 
+                }
+            }
+            
+            force = forces[i];
             let old_force = state.old_forces[i];
             
             // Swinging: How much the force vector has changed direction
@@ -228,44 +277,38 @@ impl ForceAtlas2 {
             let traction = (force + old_force).length();
             
             // Adaptive speed
-            // Global speed * (traction / (traction + swinging))
-            // We add a small epsilon to avoid division by zero
-            // Jitter tolerance allows tuning how aggressive the slowdown is
             let jt = self.jitter_tolerance;
-            let mut node_speed = 0.1 * self.speed * (jt * traction) / (jt * traction + swinging + 1e-6);
+            let node_speed = 0.1 * self.speed * (jt * traction) / (jt * traction + swinging + 1e-6);
             
-            // Mass-based integration: F = ma => a = F/m
-            // Mass = degree + 1
+            // Mass-based integration
             let degree = graph.neighbors(i).len() as f32;
             let mass = degree + 1.0;
             
-            // Apply displacement
-            // displacement = (force / mass) * node_speed
             let displacement = (force / mass) * node_speed;
             
-            // Cap displacement to prevent explosion (max 100.0 per step)
             let dist = displacement.length();
             let max_displacement = 100.0;
             
             if dist > max_displacement {
-                state.positions[i] += displacement * (max_displacement / dist);
+                pos += displacement * (max_displacement / dist);
             } else {
-                state.positions[i] += displacement;
+                pos += displacement;
             }
             
-            // Store force for next step
-            state.old_forces[i] = force;
-        }
+            (pos, force)
+        }).unzip();
+        
+        state.positions = new_positions;
+        state.old_forces = new_old_forces;
         
         // 6. Prevent Overlap (Collision)
         if self.prevent_overlap {
-            let collision_force = 100.0; // Strong force
             
             for i in 0..node_count {
                 let pos = state.positions[i];
                 
                 // Calculate radius for node i
-                let mut radius_i = self.node_radius;
+                let mut radius_i = graph.nodes[i].data.radius * self.node_radius;
                 if self.scale_by_degree {
                     let degree = graph.neighbors(i).len() as f32;
                     radius_i *= (degree + 1.0).sqrt();
@@ -291,7 +334,7 @@ impl ForceAtlas2 {
                     let dist_sq = delta.length_squared();
                     
                     // Calculate radius for node j
-                    let mut radius_j = self.node_radius;
+                    let mut radius_j = graph.nodes[j].data.radius * self.node_radius;
                     if self.scale_by_degree {
                         let degree = graph.neighbors(j).len() as f32;
                         radius_j *= (degree + 1.0).sqrt();
@@ -302,8 +345,10 @@ impl ForceAtlas2 {
                     if dist_sq < min_dist * min_dist && dist_sq > 0.001 {
                         let dist = dist_sq.sqrt();
                         let overlap = min_dist - dist;
-                        let force = delta.normalize() * overlap * collision_force;
-                        state.positions[i] += force * 0.1; 
+                        // Soft constraint: move each node by half the overlap
+                        // This prevents overshoot and jitter
+                        let correction = delta.normalize() * overlap * 0.5;
+                        state.positions[i] += correction; 
                     }
                 }
             }

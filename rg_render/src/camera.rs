@@ -5,6 +5,8 @@ pub struct Camera {
     pub position: Vec2,
     pub zoom: f32,
     pub aspect_ratio: f32,
+    pub min_zoom: f32,
+    pub max_zoom: f32,
 }
 
 impl Camera {
@@ -13,6 +15,8 @@ impl Camera {
             position: Vec2::ZERO,
             zoom: 1.0,
             aspect_ratio,
+            min_zoom: 0.00001,
+            max_zoom: 1000.0,
         }
     }
 
@@ -54,7 +58,7 @@ impl Camera {
     pub fn zoom_at(&mut self, factor: f32, center: Vec2) {
         let old_zoom = self.zoom;
         self.zoom *= factor;
-        self.zoom = self.zoom.clamp(0.00001, 1000.0);
+        self.zoom = self.zoom.clamp(self.min_zoom, self.max_zoom);
         
         // Adjust position to keep center fixed
         // center_world = position + center_offset / zoom

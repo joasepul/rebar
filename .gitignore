@@ -16,3 +16,6 @@
 
 # Data
 *.txt
+*.csv
+*.tsv
+*.json

@@ -26,7 +26,7 @@ impl CompactGraph {
         offsets.push(0);
         for i in 0..n {
             let node_neighbors = graph.neighbors(i);
-            for &neighbor in &node_neighbors {
+            for &neighbor in node_neighbors {
                 neighbors.push(neighbor as u32);
                 total_edge_weight += 1.0; // Undirected, so we count each direction
             }

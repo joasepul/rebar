@@ -28,6 +28,7 @@ impl Default for NodeData {
 #[derive(Clone, Debug)]
 pub struct Node {
     pub id: usize,
+    pub label: String,
     pub data: NodeData,
 }
 
@@ -43,6 +44,7 @@ pub struct Graph {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub adj: Vec<Vec<usize>>, // Adjacency list: node_index -> list of edge_indices
+    pub adj_neighbors: Vec<Vec<usize>>, // Adjacency list: node_index -> list of neighbor_indices
 }
 
 impl Graph {
@@ -50,10 +52,11 @@ impl Graph {
         Self::default()
     }
 
-    pub fn add_node(&mut self, position: Vec2) -> usize {
+    pub fn add_node(&mut self, position: Vec2, label: String) -> usize {
         let id = self.nodes.len();
         self.nodes.push(Node {
             id,
+            label,
             data: NodeData {
                 position,
                 radius: 5.0,
@@ -61,6 +64,7 @@ impl Graph {
             },
         });
         self.adj.push(Vec::new());
+        self.adj_neighbors.push(Vec::new());
         id
     }
 
@@ -70,27 +74,23 @@ impl Graph {
         
         if source < self.adj.len() {
             self.adj[source].push(id);
+            if source != target {
+                self.adj_neighbors[source].push(target);
+            }
         }
         if target < self.adj.len() && source != target {
             self.adj[target].push(id);
+            self.adj_neighbors[target].push(source);
         }
         
         id
     }
 
-    pub fn neighbors(&self, node_id: usize) -> Vec<usize> {
-        if node_id >= self.adj.len() {
-            return Vec::new();
+    pub fn neighbors(&self, node_id: usize) -> &[usize] {
+        if node_id >= self.adj_neighbors.len() {
+            return &[];
         }
-        
-        self.adj[node_id].iter().map(|&edge_idx| {
-            let edge = &self.edges[edge_idx];
-            if edge.source == node_id {
-                edge.target
-            } else {
-                edge.source
-            }
-        }).collect()
+        &self.adj_neighbors[node_id]
     }
     
     pub fn node_count(&self) -> usize {
