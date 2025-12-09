@@ -12,6 +12,7 @@ use bytemuck::{Pod, Zeroable};
 pub struct NodeData {
     pub position: Vec2,
     pub radius: f32,
+    pub softness: f32, // 0.0 = hard edge, 1.0 = full gradient
     pub color: [f32; 4],
 }
 
@@ -20,6 +21,7 @@ impl Default for NodeData {
         Self {
             position: Vec2::ZERO,
             radius: 5.0,
+            softness: 0.0,
             color: [1.0; 4],
         }
     }
@@ -60,6 +62,7 @@ impl Graph {
             data: NodeData {
                 position,
                 radius: 5.0,
+                softness: 0.0,
                 color: [1.0, 1.0, 1.0, 1.0],
             },
         });

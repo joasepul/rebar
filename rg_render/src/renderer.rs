@@ -207,10 +207,16 @@ impl Renderer {
                                 shader_location: 2,
                                 format: wgpu::VertexFormat::Float32,
                             },
-                            // color
+                            // softness
                             wgpu::VertexAttribute {
                                 offset: 12,
                                 shader_location: 3,
+                                format: wgpu::VertexFormat::Float32,
+                            },
+                            // color
+                            wgpu::VertexAttribute {
+                                offset: 16,
+                                shader_location: 4,
                                 format: wgpu::VertexFormat::Float32x4,
                             },
                         ],

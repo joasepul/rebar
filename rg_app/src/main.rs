@@ -675,11 +675,16 @@ impl ApplicationHandler for App {
                             // Check highlighting (Node Neighbors)
                             if !is_dimmed && self.highlight_neighbors {
                                 if let Some(selected_idx) = self.selected_node {
+                                    // Skip selected node here, we'll draw it last with a glow
+                                    if i == selected_idx {
+                                        return None;
+                                    }
+                                    
                                     // Selection Mode:
                                     // 1. Highlight selected node and its neighbors
                                     // 2. Highlight the hovered node (but NOT its neighbors)
                                     let neighbors = self.graph.neighbors(selected_idx);
-                                    let is_selected_group = i == selected_idx || neighbors.contains(&i);
+                                    let is_selected_group = neighbors.contains(&i);
                                     let is_hovered = Some(i) == self.hovered_node;
                                     
                                     if !is_selected_group && !is_hovered {
@@ -702,14 +707,11 @@ impl ApplicationHandler for App {
                             // Apply scaling
                             if self.scale_by_degree {
                                 let degree = self.graph.neighbors(i).len() as f32;
-                                node.radius *= (degree + 1.0).sqrt(); // Sqrt to avoid massive nodes
+                                node.radius *= (degree + 1.0).sqrt(); // sqrt looks better than log, used to avoid massive nodes
                             }
                             node.radius *= self.node_scale;
 
-                            if Some(i) == self.selected_node {
-                                node.color = [1.0, 1.0, 0.0, 1.0];
-                                node.radius *= 1.5;
-                            } else if Some(i) == self.hovered_node {
+                            if Some(i) == self.hovered_node {
                                 node.color = [1.0, 0.5, 0.0, 1.0];
                                 node.radius *= 1.2;
                             } else if is_dimmed {
@@ -724,8 +726,52 @@ impl ApplicationHandler for App {
                         })
                         .collect();
                         
+                    // Draw selected node last (with glow)
+                    if let Some(selected_idx) = self.selected_node {
+                        let mut show_selected = true;
+                        // Check filters for selected node
+                        let degree = self.graph.neighbors(selected_idx).len() as f32;
+                        if degree < self.filter_state.min_degree || degree > self.filter_state.max_degree {
+                            show_selected = false;
+                        }
+                        
+                        if show_selected && !self.community_assignments.is_empty() {
+                            if let Some(&comm_id) = self.community_assignments.get(selected_idx) {
+                                if let Some(info) = self.communities.get(&comm_id) {
+                                    if !info.visible {
+                                        show_selected = false;
+                                    }
+                                    if info.count < self.filter_state.min_community_size || info.count > self.filter_state.max_community_size {
+                                        show_selected = false;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if show_selected {
+                            let mut node = self.graph.nodes[selected_idx].data;
+                            
+                            // Apply scaling
+                            if self.scale_by_degree {
+                                let degree = self.graph.neighbors(selected_idx).len() as f32;
+                                node.radius *= (degree + 1.0).sqrt();
+                            }
+                            node.radius *= self.node_scale;
+                            
+                            // 1. Glow (Behind)
+                            let mut glow_node = node;
+                            glow_node.radius *= 2.0; // Large glow
+                            glow_node.softness = 1.0; // Full soft gradient
+                            glow_node.color = [1.0, 1.0, 1.0, 0.5]; // White transparent glow
+                            visible_nodes.push(glow_node);
+                            
+                            // 2. Actual Node (Front)
+                            visible_nodes.push(node);
+                        }
+                    }
+                        
                     if visible_nodes.is_empty() {
-                        visible_nodes.push(NodeData { position: Vec2::splat(-10000.0), radius: 0.0, color: [0.0; 4] });
+                        visible_nodes.push(NodeData { position: Vec2::splat(-10000.0), radius: 0.0, softness: 0.0, color: [0.0; 4] });
                     }
                     
                     use rg_render::EdgeInstance;
@@ -1270,9 +1316,9 @@ impl ApplicationHandler for App {
                                     // Draw background rect for readability
                                     let galley = painter.layout_no_wrap(text, egui::FontId::proportional(font_size), text_color);
                                     let rect = galley.rect.translate(screen_pos - galley.rect.center_bottom());
-                                    let padded_rect = rect.expand(2.0);
+                                    let padded_rect = rect.expand(5.0);
                                     
-                                    painter.rect_filled(padded_rect, 2.0, egui::Color32::from_black_alpha(150));
+                                    painter.rect_filled(padded_rect, 5.0, egui::Color32::from_black_alpha(200));
                                     painter.galley(rect.min, galley, text_color);
                                 }
                             };
@@ -1492,48 +1538,46 @@ fn main() {
     
     // Parse CLI args
     let args: Vec<String> = std::env::args().collect();
-    let default_path = "facebook_combined.txt".to_string();
-    let path = if args.len() > 1 {
-        &args[1]
-    } else {
-        &default_path
-    };
     
-    // Load graph from file
-    let graph = match load_graph_from_file(path) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("Failed to load graph from {}: {}", path, e);
-            if path != &default_path {
-                 eprintln!("Trying default file: {}...", default_path);
-                 match load_graph_from_file(&default_path) {
-                     Ok(g) => g,
-                     Err(e) => {
-                         eprintln!("Failed to load default graph: {}", e);
-                         eprintln!("Falling back to random graph...");
-                         let mut graph = Graph::new();
-                         // ... (random graph generation code is below, we can just let it fall through or duplicate logic)
-                         // Actually the original code had a fallback block.
-                         // Let's just return empty graph or random here to keep it simple.
-                         Graph::new()
-                     }
-                 }
-            } else {
+    // Load graph from file if provided
+    let graph = if args.len() > 1 {
+        let path = &args[1];
+        match load_graph_from_file(path) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("Failed to load graph from {}: {}", path, e);
                 eprintln!("Falling back to random graph...");
-                let mut graph = Graph::new();
-                graph
+                Graph::new()
             }
         }
+    } else {
+        println!("No graph file provided. Generating random graph...");
+        Graph::new()
     };
     
     // If graph is empty (failed load), generate random
     let graph = if graph.node_count() == 0 {
         let mut graph = Graph::new();
         let mut rng = rand::thread_rng();
-        for i in 0..100 {
-             let pos = Vec2::new(rng.gen_range(-100.0..100.0), rng.gen_range(-100.0..100.0));
+        let node_count = 1000; 
+        
+        for i in 0..node_count {
+             let pos = Vec2::new(rng.gen_range(-1000.0..1000.0), rng.gen_range(-1000.0..1000.0));
              graph.add_node(pos, format!("Node {}", i));
         }
+        
+        // Add random edges 
+        for i in 0..node_count {
+            let degree = rng.gen_range(1..=6);
+            for _ in 0..degree {
+                let target = rng.gen_range(0..node_count);
+                if i != target {
+                    graph.add_edge(i, target);
+                }
+            }
+        }
+        
+        println!("Generated random graph with {} nodes and {} edges", graph.node_count(), graph.edge_count());
         graph
     } else {
         graph

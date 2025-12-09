@@ -14,13 +14,15 @@ struct VertexInput {
 struct InstanceInput {
     @location(1) instance_pos: vec2<f32>,
     @location(2) radius: f32,
-    @location(3) color: vec4<f32>,
+    @location(3) softness: f32,
+    @location(4) color: vec4<f32>,
 };
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) uv: vec2<f32>,
+    @location(2) softness: f32,
 };
 
 @vertex
@@ -36,6 +38,7 @@ fn vs_main(
     out.clip_position = camera.view_proj * vec4<f32>(world_pos, 0.0, 1.0);
     out.color = instance.color;
     out.uv = model.position; // -1 to 1
+    out.softness = instance.softness;
     return out;
 }
 
@@ -49,8 +52,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
     
-    // Simple anti-aliasing
-    let alpha = 1.0 - smoothstep(0.9, 1.0, dist);
+    // Anti-aliasing / Softness
+    // If softness is 0.0, we want sharp edge (0.9 to 1.0)
+    // If softness is 1.0, we want full gradient (0.0 to 1.0)
+    
+    let edge_start = 1.0 - clamp(in.softness, 0.1, 1.0);
+    let alpha = 1.0 - smoothstep(edge_start, 1.0, dist);
     
     return vec4<f32>(in.color.rgb, in.color.a * alpha);
 }
